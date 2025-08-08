@@ -26,9 +26,11 @@ def get_current_dns_ip(host, domain):
     """Retrieve the current IP address from DNS for the given host and domain."""
     try:
         import socket
-        return socket.gethostbyname(f"{host}.{domain}")
+        # Use bare domain for '@' host, otherwise construct host.domain
+        hostname = domain if host == "@" else f"{host}.{domain}"
+        return socket.gethostbyname(hostname)
     except socket.gaierror as e:
-        print(f"Error resolving DNS for {host}.{domain}: {e}")
+        print(f"Error resolving DNS for {hostname}: {e}")
         return None
 
 def update_namecheap_ddns(host, domain, password, ip):
@@ -66,12 +68,14 @@ def main():
         # Get current DNS IP
         dns_ip = get_current_dns_ip(host, DOMAIN)
         if dns_ip == current_ip:
-            print(f"No update needed for {host}.{DOMAIN}. IP: {dns_ip}")
+            hostname = DOMAIN if host == "@" else f"{host}.{DOMAIN}"
+            print(f"No update needed for {hostname}. IP: {dns_ip}")
             continue
 
         # Update DNS if IPs differ
         if update_namecheap_ddns(host, DOMAIN, PASSWORD, current_ip):
-            print(f"Updated {host}.{DOMAIN} to {current_ip}")
+            hostname = DOMAIN if host == "@" else f"{host}.{DOMAIN}"
+            print(f"Updated {hostname} to {current_ip}")
         else:
             print(f"Failed to update {host}.{DOMAIN}")
 
