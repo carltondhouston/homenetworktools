@@ -1,1 +1,5 @@
 This repo has various scripts I use to manage things on my internal network at home.  I don''t know why I am putting them in git, but here they are.
+
+Added my script for updating namecheap dynamic dns.  I generally use .env for everything, so chop out the parts you don't need for whatever you're doing and rename it to .env.  The comments should help you
+find what you need.
+
