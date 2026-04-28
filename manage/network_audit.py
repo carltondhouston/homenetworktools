@@ -70,10 +70,9 @@ PHPIPAM_URL     = os.getenv("PHPIPAM_URL",  "http://phpipam.chcasa.us")
 PHPIPAM_APP     = os.getenv("PHPIPAM_APP",  "audit")
 PHPIPAM_TOKEN   = _require("PHPIPAM_TOKEN")   # Administration → API → App token
 
-UNIFI_URL       = os.getenv("UNIFI_URL",       "https://192.168.1.1")
-UNIFI_SITE      = os.getenv("UNIFI_SITE",      "default")
-UNIFI_USER      = _require("UNIFI_USER")
-UNIFI_PASS      = _require("UNIFI_PASS")
+UNIFI_URL       = os.getenv("UNIFI_URL",  "https://192.168.1.1")
+UNIFI_SITE      = os.getenv("UNIFI_SITE", "default")
+UNIFI_API_KEY   = _require("UNIFI_API_KEY")   # Network Application → Settings → Integrations → API Keys
 
 # Comma-separated in .env: PORTAINER_HOSTS=canister,doodoo
 _hosts_raw      = os.getenv("PORTAINER_HOSTS", "canister,doodoo")
@@ -250,43 +249,34 @@ class PhpIpamClient:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class UnifiClient:
-    def __init__(self, base_url: str, user: str, password: str, site: str = "default"):
+    def __init__(self, base_url: str, api_key: str, site: str = "default"):
         self.base = base_url.rstrip("/")
         self.site = site
         self.session = requests.Session()
         self.session.verify = False
-        self._login(user, password)
-
-    def _login(self, user: str, password: str):
-        # UniFi OS (UDM Pro) login endpoint
-        r = self.session.post(
-            f"{self.base}/api/auth/login",
-            json={"username": user, "password": password},
-            headers={"Content-Type": "application/json"},
-        )
-        if r.status_code not in (200, 201):
-            # Fallback: older controller path
-            r = self.session.post(
-                f"{self.base}/api/login",
-                json={"username": user, "password": password},
-            )
-        r.raise_for_status()
+        # Official Network Integration API — stateless, no login/logout needed.
+        # Generate the key at: Network Application → Settings → Integrations → API Keys
+        self.session.headers.update({"X-API-Key": api_key})
+        # Base for the official integration API (UDM Pro / UniFi OS)
+        self.api_base = f"{self.base}/proxy/network/integration/v1"
+        # Base for the classic internal API (broader endpoint coverage)
+        self.classic_base = f"{self.base}/proxy/network/api/s/{site}"
 
     def _get(self, path: str) -> list:
-        r = self.session.get(f"{self.base}{path}")
+        r = self.session.get(path)
         r.raise_for_status()
         data = r.json()
-        # UniFi wraps in {"data": [...], "meta": {...}}
         if isinstance(data, dict):
             return data.get("data", [])
         return data
 
     def get_active_clients(self) -> list[dict]:
-        return self._get(f"/proxy/network/api/s/{self.site}/stat/sta")
+        # Classic path — richer per-client data, still works with API key auth
+        return self._get(f"{self.classic_base}/stat/sta")
 
     def get_all_known_clients(self) -> list[dict]:
         """All clients UniFi has ever seen (includes inactive)."""
-        return self._get(f"/proxy/network/api/s/{self.site}/rest/user")
+        return self._get(f"{self.classic_base}/rest/user")
 
     def fetch_clients(self) -> dict[str, UnifiClient]:
         """Returns {ip: UnifiClient}. Uses known clients; active ones overwrite."""
@@ -509,7 +499,7 @@ def main():
 
     if run2:
         print("\n[ UniFi ] Fetching client list...")
-        unifi = UnifiClient(UNIFI_URL, UNIFI_USER, UNIFI_PASS, UNIFI_SITE)
+        unifi = UnifiClient(UNIFI_URL, UNIFI_API_KEY, UNIFI_SITE)
         unifi_clients = unifi.fetch_clients()
         print(f"  Found {len(unifi_clients)} clients with known IPs in UniFi")
         report_unifi_vs_phpipam(unifi_clients, phpipam_addresses, write_csv=args.csv)
