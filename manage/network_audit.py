@@ -100,7 +100,7 @@ class PhpIpamRecord:
     custom_notes: str
 
 @dataclass
-class UnifiClient:
+class UnifiClientRecord:
     mac: str
     ip: str
     hostname: str
@@ -275,38 +275,67 @@ class PhpIpamClient:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class UnifiClient:
-    def __init__(self, base_url: str, api_key: str, site: str = "default"):
+    def __init__(self, base_url: str, api_key: str, site: str = "default", debug: bool = False):
         self.base = base_url.rstrip("/")
         self.site = site
+        self._debug = debug
         self.session = requests.Session()
         self.session.verify = False
-        # Official Network Integration API — stateless, no login/logout needed.
-        # Generate the key at: Network Application → Settings → Integrations → API Keys
+        # Local Network Integration API key — generate this from within the
+        # Network Application at: Settings → Control Plane → Integrations → API Keys
+        # This is NOT the same as the Site Manager key from unifi.ui.com.
+        # The Site Manager key is a cloud API that does not expose client/station data.
         self.session.headers.update({"X-API-Key": api_key})
-        # Base for the official integration API (UDM Pro / UniFi OS)
+        # The integration v1 path for site discovery
         self.api_base = f"{self.base}/proxy/network/integration/v1"
-        # Base for the classic internal API (broader endpoint coverage)
+        # Classic internal path — richer client data than integration/v1
         self.classic_base = f"{self.base}/proxy/network/api/s/{site}"
 
-    def _get(self, path: str) -> list:
-        r = self.session.get(path)
+    def _get(self, path: str, timeout: int = 10) -> list:
+        if self._debug:
+            import time
+            print(f"  [UniFi] GET {path}", flush=True)
+            t0 = time.monotonic()
+        try:
+            r = self.session.get(path, timeout=timeout)
+        except requests.exceptions.Timeout:
+            print(f"  [UniFi] *** TIMEOUT after {timeout}s: {path}", flush=True)
+            return []
+        except requests.exceptions.ConnectionError as e:
+            print(f"  [UniFi] *** CONNECTION ERROR: {e}", flush=True)
+            return []
+        if self._debug:
+            elapsed = time.monotonic() - t0
+            print(f"  [UniFi]  -> {r.status_code} in {elapsed:.2f}s", flush=True)
+        if r.status_code == 401:
+            print(f"  [UniFi] *** 401 Unauthorized — wrong key, or key is a Site Manager", flush=True)
+            print(f"           key from unifi.ui.com instead of a local Network Application key.", flush=True)
+            return []
+        if r.status_code == 403:
+            print(f"  [UniFi] *** 403 Forbidden — key may lack permissions or site '{self.site}' is wrong.", flush=True)
+            return []
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict):
+            # Classic API wraps in {"data": [...], "meta": {...}}
+            if data.get("meta", {}).get("rc") == "error":
+                msg = data.get("meta", {}).get("msg", "unknown")
+                print(f"  [UniFi] *** API error: {msg}", flush=True)
+                return []
             return data.get("data", [])
         return data
 
     def get_active_clients(self) -> list[dict]:
-        # Classic path — richer per-client data, still works with API key auth
+        """Currently connected clients."""
         return self._get(f"{self.classic_base}/stat/sta")
 
     def get_all_known_clients(self) -> list[dict]:
-        """All clients UniFi has ever seen (includes inactive)."""
+        """All clients UniFi has ever seen, including inactive."""
         return self._get(f"{self.classic_base}/rest/user")
 
-    def fetch_clients(self) -> dict[str, UnifiClient]:
+    def fetch_clients(self) -> dict[str, UnifiClientRecord]:
         """Returns {ip: UnifiClient}. Uses known clients; active ones overwrite."""
-        clients: dict[str, "UnifiClient"] = {}
+        clients: dict[str, UnifiClientRecord] = {}
 
         for c in self.get_all_known_clients():
             ip = (c.get("use_fixedip") and c.get("fixed_ip")) or ""
@@ -314,7 +343,7 @@ class UnifiClient:
                 continue  # skip clients with no known IP
             mac  = (c.get("mac") or "").lower()
             host = c.get("hostname") or c.get("name") or mac
-            clients[ip] = UnifiClient(
+            clients[ip] = UnifiClientRecord(
                 mac=mac,
                 ip=ip,
                 hostname=host,
@@ -329,7 +358,7 @@ class UnifiClient:
                 continue
             mac  = (c.get("mac") or "").lower()
             host = c.get("hostname") or c.get("name") or mac
-            clients[ip] = UnifiClient(
+            clients[ip] = UnifiClientRecord(
                 mac=mac,
                 ip=ip,
                 hostname=host,
@@ -399,7 +428,7 @@ def report_container_audit(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def report_unifi_vs_phpipam(
-    unifi_clients: dict[str, "UnifiClient"],
+    unifi_clients: dict[str, UnifiClientRecord],
     phpipam_addresses: dict[str, PhpIpamRecord],
     write_csv: bool = False,
 ):
@@ -527,7 +556,7 @@ def main():
 
     if run2:
         print("\n[ UniFi ] Fetching client list...")
-        unifi = UnifiClient(UNIFI_URL, UNIFI_API_KEY, UNIFI_SITE)
+        unifi = UnifiClient(UNIFI_URL, UNIFI_API_KEY, UNIFI_SITE, debug=args.debug)
         unifi_clients = unifi.fetch_clients()
         print(f"  Found {len(unifi_clients)} clients with known IPs in UniFi")
         report_unifi_vs_phpipam(unifi_clients, phpipam_addresses, write_csv=args.csv)
