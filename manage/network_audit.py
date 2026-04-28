@@ -66,10 +66,9 @@ def _require(key: str) -> str:
 PORTAINER_URL   = os.getenv("PORTAINER_URL",   "https://canister:9443")
 PORTAINER_TOKEN = _require("PORTAINER_TOKEN")
 
-PHPIPAM_URL     = os.getenv("PHPIPAM_URL",     "http://phpipam.chcasa.us")
-PHPIPAM_APP     = os.getenv("PHPIPAM_APP",     "audit")
-PHPIPAM_USER    = _require("PHPIPAM_USER")
-PHPIPAM_PASS    = _require("PHPIPAM_PASS")
+PHPIPAM_URL     = os.getenv("PHPIPAM_URL",  "http://phpipam.chcasa.us")
+PHPIPAM_APP     = os.getenv("PHPIPAM_APP",  "audit")
+PHPIPAM_TOKEN   = _require("PHPIPAM_TOKEN")   # Administration → API → App token
 
 UNIFI_URL       = os.getenv("UNIFI_URL",       "https://192.168.1.1")
 UNIFI_SITE      = os.getenv("UNIFI_SITE",      "default")
@@ -194,23 +193,18 @@ class PortainerClient:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PhpIpamClient:
-    def __init__(self, base_url: str, app: str, user: str, password: str):
+    def __init__(self, base_url: str, app: str, app_token: str):
         self.base = f"{base_url.rstrip('/')}/api/{app}"
         self.session = requests.Session()
-        self._authenticate(user, password)
-
-    def _authenticate(self, user: str, password: str):
-        r = self.session.post(
-            f"{self.base}/user/",
-            auth=(user, password),
-            verify=False,
-        )
-        r.raise_for_status()
-        data = r.json()
-        token = data.get("data", {}).get("token")
-        if not token:
-            sys.exit(f"phpIPAM auth failed: {data.get('message', 'unknown error')}")
-        self.session.headers.update({"token": token})
+        # Static app token — set "App security" to "SSL with App token" in
+        # phpIPAM Administration → API.  The token goes in the Authorization
+        # header as a Bearer token; phpIPAM also accepts a plain "token"
+        # header, included here as a fallback for older phpIPAM versions.
+        self.session.headers.update({
+            "Authorization": f"Bearer {app_token}",
+            "token": app_token,
+        })
+        self.session.verify = False
 
     def _get(self, path: str) -> dict | list | None:
         r = self.session.get(f"{self.base}{path}", verify=False)
@@ -502,7 +496,7 @@ def main():
     run2 = args.report in ("2", "both")
 
     print("\n[ phpIPAM ] Authenticating and fetching addresses...")
-    phpipam = PhpIpamClient(PHPIPAM_URL, PHPIPAM_APP, PHPIPAM_USER, PHPIPAM_PASS)
+    phpipam = PhpIpamClient(PHPIPAM_URL, PHPIPAM_APP, PHPIPAM_TOKEN)
     phpipam_addresses = phpipam.fetch_all_addresses()
     print(f"  Found {len(phpipam_addresses)} addresses in phpIPAM")
 
