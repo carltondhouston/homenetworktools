@@ -1,1 +1,10 @@
+# Secrets — never commit these
 .env
+
+# Audit output directory
+audit_output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
