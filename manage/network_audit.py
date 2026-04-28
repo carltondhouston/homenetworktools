@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import csv
+import ipaddress
 import os
 import sys
 from dataclasses import dataclass
@@ -239,6 +240,19 @@ class PhpIpamClient:
     def get_addresses_in_subnet(self, subnet_id: int) -> list[dict]:
         return self._get(f"/subnets/{subnet_id}/addresses/") or []
 
+    def fetch_known_networks(self) -> list[ipaddress.IPv4Network]:
+        """Return every subnet defined in phpIPAM as an IPv4Network object."""
+        networks = []
+        for s in self.get_subnets():
+            subnet = s.get("subnet", "")
+            mask   = s.get("mask", "")
+            if subnet and mask:
+                try:
+                    networks.append(ipaddress.IPv4Network(f"{subnet}/{mask}", strict=False))
+                except ValueError:
+                    pass
+        return networks
+
     def fetch_all_addresses(self) -> dict[str, PhpIpamRecord]:
         """Returns {ip_str: PhpIpamRecord} for every recorded address."""
         subnets = self.get_subnets()
@@ -376,6 +390,7 @@ class UnifiClient:
 def report_container_audit(
     containers: list[ContainerRecord],
     phpipam_addresses: dict[str, PhpIpamRecord],
+    subnet_filter=None,
     write_csv: bool = False,
 ):
     print("\n" + "═" * 90)
@@ -397,6 +412,8 @@ def report_container_audit(
                     c.host, c.name, c.status, net_name, "—",
                     "❌ dynamic / no IP", "—",
                 ])
+                continue
+            if subnet_filter and not subnet_filter(ip):
                 continue
 
             static_flag = "✅ static" if net["static"] else "⚠ dynamic"
@@ -430,6 +447,7 @@ def report_container_audit(
 def report_unifi_vs_phpipam(
     unifi_clients: dict[str, UnifiClientRecord],
     phpipam_addresses: dict[str, PhpIpamRecord],
+    subnet_filter=None,
     write_csv: bool = False,
 ):
     print("\n" + "═" * 90)
@@ -437,7 +455,8 @@ def report_unifi_vs_phpipam(
     print("═" * 90)
 
     all_ips = sorted(
-        set(unifi_clients.keys()) | set(phpipam_addresses.keys()),
+        {ip for ip in (set(unifi_clients.keys()) | set(phpipam_addresses.keys()))
+         if not subnet_filter or subnet_filter(ip)},
         key=lambda ip: tuple(int(p) for p in ip.split(".") if p.isdigit())
     )
 
@@ -526,6 +545,23 @@ def _write_csv(path: str, headers: list[str], rows: list[list]):
     print(f"  → CSV written: {path}")
 
 
+def _make_subnet_filter(
+    networks: list[ipaddress.IPv4Network],
+) -> "Callable[[str], bool]":
+    """Return a predicate that is True when an IP string falls inside any of
+    the given networks.  When *networks* is empty the filter accepts everything
+    (i.e. --known-subnets-only has no effect if phpIPAM has no subnets)."""
+    if not networks:
+        return lambda _ip: True
+    def _in_subnet(ip_str: str) -> bool:
+        try:
+            addr = ipaddress.IPv4Address(ip_str)
+            return any(addr in net for net in networks)
+        except ValueError:
+            return False
+    return _in_subnet
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -537,6 +573,9 @@ def main():
                         help="Which report to run (default: both)")
     parser.add_argument("--debug", action="store_true",
                         help="Print each HTTP request with URL, status, and elapsed time")
+    parser.add_argument("--known-subnets-only", action="store_true",
+                        help="Exclude IPs from Portainer and UniFi that do not fall "
+                             "within any subnet defined in phpIPAM")
     args = parser.parse_args()
 
     run1 = args.report in ("1", "both")
@@ -547,19 +586,28 @@ def main():
     phpipam_addresses = phpipam.fetch_all_addresses()
     print(f"  Found {len(phpipam_addresses)} addresses in phpIPAM")
 
+    subnet_filter = None
+    if args.known_subnets_only:
+        known_networks = phpipam.fetch_known_networks()
+        subnet_filter  = _make_subnet_filter(known_networks)
+        print(f"  Subnet filter active: {len(known_networks)} phpIPAM subnet(s) — "
+              f"IPs outside these will be excluded from reports")
+
     if run1:
         print("\n[ Portainer ] Fetching containers...")
         portainer = PortainerClient(PORTAINER_URL, PORTAINER_TOKEN)
         containers = portainer.fetch_all_containers(PORTAINER_HOSTS)
         print(f"  Found {len(containers)} containers across {PORTAINER_HOSTS}")
-        report_container_audit(containers, phpipam_addresses, write_csv=args.csv)
+        report_container_audit(containers, phpipam_addresses,
+                               subnet_filter=subnet_filter, write_csv=args.csv)
 
     if run2:
         print("\n[ UniFi ] Fetching client list...")
         unifi = UnifiClient(UNIFI_URL, UNIFI_API_KEY, UNIFI_SITE, debug=args.debug)
         unifi_clients = unifi.fetch_clients()
         print(f"  Found {len(unifi_clients)} clients with known IPs in UniFi")
-        report_unifi_vs_phpipam(unifi_clients, phpipam_addresses, write_csv=args.csv)
+        report_unifi_vs_phpipam(unifi_clients, phpipam_addresses,
+                                subnet_filter=subnet_filter, write_csv=args.csv)
 
     print()
 
