@@ -192,8 +192,9 @@ class PortainerClient:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PhpIpamClient:
-    def __init__(self, base_url: str, app: str, app_token: str):
+    def __init__(self, base_url: str, app: str, app_token: str, debug: bool = False):
         self.base = f"{base_url.rstrip('/')}/api/{app}"
+        self._debug = debug
         self.session = requests.Session()
         # Static app token — set "App security" to "SSL with App token" in
         # phpIPAM Administration → API.  The token goes in the Authorization
@@ -205,13 +206,30 @@ class PhpIpamClient:
         })
         self.session.verify = False
 
-    def _get(self, path: str) -> dict | list | None:
-        r = self.session.get(f"{self.base}{path}", verify=False)
+    def _get(self, path: str, timeout: int = 10) -> dict | list | None:
+        url = f"{self.base}{path}"
+        if self._debug:
+            import time
+            print(f"  [phpIPAM] GET {url}", flush=True)
+            t0 = time.monotonic()
+        try:
+            r = self.session.get(url, verify=False, timeout=timeout)
+        except requests.exceptions.Timeout:
+            print(f"  [phpIPAM] *** TIMEOUT after {timeout}s: {url}", flush=True)
+            return None
+        except requests.exceptions.ConnectionError as e:
+            print(f"  [phpIPAM] *** CONNECTION ERROR: {e}", flush=True)
+            return None
+        if self._debug:
+            elapsed = time.monotonic() - t0
+            print(f"  [phpIPAM]  -> {r.status_code} in {elapsed:.2f}s", flush=True)
         if r.status_code == 404:
             return None
         r.raise_for_status()
         payload = r.json()
         if not payload.get("success"):
+            if self._debug:
+                print(f"  [phpIPAM]  -> success=false  message={payload.get('message')}", flush=True)
             return None
         return payload.get("data")
 
@@ -224,11 +242,19 @@ class PhpIpamClient:
     def fetch_all_addresses(self) -> dict[str, PhpIpamRecord]:
         """Returns {ip_str: PhpIpamRecord} for every recorded address."""
         subnets = self.get_subnets()
+        if self._debug:
+            print(f"  [phpIPAM] Found {len(subnets)} subnets", flush=True)
         all_records: dict[str, PhpIpamRecord] = {}
         for subnet in subnets:
             sid   = subnet.get("id")
             sdesc = subnet.get("description") or subnet.get("subnet", "")
+            snet  = subnet.get("subnet", "")
+            smask = subnet.get("mask", "")
+            if self._debug:
+                print(f"  [phpIPAM] Fetching addresses for subnet {snet}/{smask} (id={sid}, '{sdesc}')", flush=True)
             addrs = self.get_addresses_in_subnet(sid)
+            if self._debug:
+                print(f"  [phpIPAM]  -> {len(addrs)} addresses", flush=True)
             for a in addrs:
                 ip = a.get("ip", "")
                 if not ip:
@@ -480,13 +506,15 @@ def main():
     parser.add_argument("--csv", action="store_true", help="Also write CSV output files")
     parser.add_argument("--report", choices=["1", "2", "both"], default="both",
                         help="Which report to run (default: both)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print each HTTP request with URL, status, and elapsed time")
     args = parser.parse_args()
 
     run1 = args.report in ("1", "both")
     run2 = args.report in ("2", "both")
 
     print("\n[ phpIPAM ] Authenticating and fetching addresses...")
-    phpipam = PhpIpamClient(PHPIPAM_URL, PHPIPAM_APP, PHPIPAM_TOKEN)
+    phpipam = PhpIpamClient(PHPIPAM_URL, PHPIPAM_APP, PHPIPAM_TOKEN, debug=args.debug)
     phpipam_addresses = phpipam.fetch_all_addresses()
     print(f"  Found {len(phpipam_addresses)} addresses in phpIPAM")
 
