@@ -1,8 +1,11 @@
 # Secrets — never commit these
 .env
 
-# Audit output directory
-audit_output/
+# Audit CSV output (ephemeral)
+audit_output/*.csv
+
+# Baseline IS committed — it's the source of truth for change detection
+# audit_output/npm_baseline.json  ← intentionally not ignored
 
 # Python
 __pycache__/

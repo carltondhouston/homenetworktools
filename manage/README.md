@@ -41,9 +41,13 @@ For each proxy host in Nginx Proxy Manager, resolves the `forward_host` to an IP
 - **❌ cannot resolve** — the forward host couldn't be resolved to an IP
 - **⏸ disabled** — the proxy rule is present but disabled in NPM
 
-The consistency check is a heuristic, not authoritative. It tokenises the subdomain of the proxy domain and the destination names on common separators (`-`, `_`, `.`) and looks for any shared token of three or more characters. This catches obvious mismatches (e.g. `wiki.chcasa.us` pointing to `phpipam-web`) while being lenient enough to handle naming variations.
+The consistency check works in two modes depending on whether a baseline exists:
 
-Disabled proxy hosts are included in the report but prefixed so they stand out.
+**With a baseline** (recommended): the report compares the current state against the last saved snapshot and flags any change — IP address shift, forward target change, or container change. This is reliable and requires no naming conventions. A domain that was pointing at `audiobookshelf` last time and is now pointing at `phpipam-web` shows up as `🔴 IP CHANGED` regardless of what any of those names mean.
+
+**Without a baseline** (first run): falls back to a token-matching heuristic that looks for shared words between the proxy subdomain and the destination name. This is intentionally approximate — `books.chcasa.us → audiobookshelf` will show `⚠ verify` rather than a false positive, since "books" and "audiobookshelf" share no tokens. The summary line will remind you to run `--save-baseline`.
+
+Disabled proxy hosts are included in the report but prefixed so they stand out. Domains that were in the baseline but have since been removed from NPM appear as `🔴 REMOVED` rows at the bottom.
 
 ---
 
@@ -148,6 +152,9 @@ python3 network_audit.py --report 2
 # Run only the NPM proxy consistency check (Report 3)
 python3 network_audit.py --report 3
 
+# Save current NPM state as the baseline for future change detection
+python3 network_audit.py --report 3 --save-baseline
+
 # Reports 1 and 2 only (original "both" behaviour)
 python3 network_audit.py --report both
 
@@ -168,6 +175,34 @@ When this flag is set, the script fetches the subnet list from phpIPAM and build
 This is useful for filtering out Docker-internal addresses (e.g. `172.17.0.0/16` bridge networks) that you haven't and don't intend to document in phpIPAM.
 
 If phpIPAM returns no subnets, the filter is a no-op and all IPs are included.
+
+### `--save-baseline`
+
+Saves the current NPM proxy state to `audit_output/npm_baseline.json` after running Report 3. On all subsequent runs, Report 3 will automatically load this file and compare the current state against it, replacing the heuristic assessment with precise change detection:
+
+| Indicator | Meaning |
+|---|---|
+| `✅ matches baseline` | Domain, IP, forward target, and container are all unchanged |
+| `🔴 IP CHANGED` | The resolved IP is different from the baseline — likely the real problem you're looking for |
+| `🟡 forward changed` | Forward scheme/host/port changed but IP is the same |
+| `🟡 container changed` | The IP now belongs to a different container |
+| `🆕 new` | Domain exists in NPM but wasn't in the baseline |
+| `🔴 REMOVED` | Domain was in the baseline but no longer exists in NPM |
+
+**Workflow:**
+
+```bash
+# First time: establish the baseline when things are known good
+python3 network_audit.py --report 3 --save-baseline
+
+# Subsequent runs: change detection is automatic
+python3 network_audit.py --report 3
+
+# After intentionally changing something: update the baseline
+python3 network_audit.py --report 3 --save-baseline
+```
+
+The baseline file (`audit_output/npm_baseline.json`) is intentionally **not** git-ignored — committing it means your baseline travels with the repo and changes to it appear in git history.
 
 ### `--debug`
 
@@ -209,6 +244,8 @@ When `--csv` is passed, up to three files are written to `./audit_output/`:
 - `unifi_phpipam_diff.csv` — Report 2 data
 - `npm_consistency.csv` — Report 3 data
 
+The baseline file is stored separately at `audit_output/npm_baseline.json` and is not overwritten by `--csv`. It is only updated when `--save-baseline` is explicitly passed.
+
 The `audit_output/` directory is excluded from version control by `.gitignore`.
 
 ---
@@ -234,7 +271,11 @@ NPM_URL=http://npm.chcasa.us:81
 ├── .env                # Your local credentials (git-ignored)
 ├── .gitignore
 ├── README.md
-└── audit_output/       # CSV output directory (git-ignored, created on demand)
+├── audit_output/
+│   ├── npm_baseline.json   # Baseline for Report 3 change detection (commit this)
+│   ├── container_audit.csv # git-ignored
+│   ├── unifi_phpipam_diff.csv
+│   └── npm_consistency.csv
 ```
 
 ---

@@ -33,9 +33,11 @@ Usage:
 import argparse
 import csv
 import ipaddress
+import json
 import os
 import socket
 import sys
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -641,11 +643,15 @@ def report_npm_consistency(
     proxy_hosts: list[NpmProxyRecord],
     phpipam_addresses: dict[str, PhpIpamRecord],
     containers: list[ContainerRecord] | None,
+    baseline: dict | None = None,
+    save_baseline: bool = False,
     write_csv: bool = False,
     debug: bool = False,
 ):
     print("\n" + "═" * 110)
     print("  REPORT 3 — NPM PROXY HOST CONSISTENCY")
+    if baseline is not None:
+        print("  (comparing against saved baseline)")
     print("═" * 110)
 
     # Build a flat IP → container_name lookup from Portainer data
@@ -658,58 +664,105 @@ def report_npm_consistency(
                     ip_to_container[ip] = c.name
 
     rows = []
+    current_entries: dict[str, dict] = {}   # built up for optional baseline save
+    seen_domains: set[str] = set()
+
     for h in sorted(proxy_hosts, key=lambda x: x.domain):
-        status_prefix = "" if h.enabled else "⏸ disabled — "
+        seen_domains.add(h.domain)
+        disabled_prefix = "" if h.enabled else "⏸ disabled — "
 
         # Resolve forward_host to an IP
         resolved_ip = _resolve_host(h.forward_host)
         if debug and h.forward_host != resolved_ip:
             print(f"  [NPM] {h.forward_host} → {resolved_ip or 'unresolvable'}", flush=True)
 
+        forward_display = f"{h.forward_scheme}://{h.forward_host}:{h.forward_port}"
+
         if not resolved_ip:
             rows.append([
-                h.domain,
-                f"{h.forward_host}:{h.forward_port}",
-                "—",
-                "—",
-                "—",
-                f"{status_prefix}❌ cannot resolve forward host",
+                h.domain, forward_display, "—", "—", "—",
+                f"{disabled_prefix}❌ cannot resolve forward host",
             ])
             continue
 
-        phpipam_rec   = phpipam_addresses.get(resolved_ip)
-        phpipam_host  = phpipam_rec.hostname if phpipam_rec else ""
+        phpipam_rec    = phpipam_addresses.get(resolved_ip)
+        phpipam_host   = phpipam_rec.hostname if phpipam_rec else ""
         container_name = ip_to_container.get(resolved_ip, "")
+        ipam_display   = ("❌ not in phpIPAM" if not phpipam_rec
+                          else phpipam_host or "(no hostname)")
 
-        if not phpipam_rec:
-            ipam_display = "❌ not in phpIPAM"
+        # ── Baseline comparison ──────────────────────────────────────────────
+        if baseline is not None:
+            prev = baseline.get(h.domain)
+            if prev is None:
+                assessment = "🆕 new — not in baseline"
+            elif prev["resolved_ip"] != resolved_ip:
+                assessment = (f"🔴 IP CHANGED — was {prev['resolved_ip']} "
+                              f"now {resolved_ip}")
+            elif prev.get("forward") != forward_display:
+                assessment = (f"🟡 forward changed — was {prev['forward']} "
+                              f"now {forward_display}")
+            elif prev.get("container") != (container_name or "—"):
+                assessment = (f"🟡 container changed — was {prev.get('container')} "
+                              f"now {container_name or '—'}")
+            else:
+                assessment = "✅ matches baseline"
         else:
-            ipam_display = phpipam_host or "(no hostname)"
+            # No baseline: fall back to token heuristic
+            assessment = _assess_consistency(
+                h.domain, h.forward_host, phpipam_host, container_name
+            )
 
-        assessment = _assess_consistency(
-            h.domain, h.forward_host, phpipam_host, container_name
-        )
-        if status_prefix:
-            assessment = status_prefix + assessment
+        if disabled_prefix:
+            assessment = disabled_prefix + assessment
+
+        # Record current state for potential baseline save
+        current_entries[h.domain] = {
+            "resolved_ip": resolved_ip,
+            "forward":     forward_display,
+            "phpipam_host": phpipam_host,
+            "container":   container_name or "—",
+        }
 
         rows.append([
-            h.domain,
-            f"{h.forward_scheme}://{h.forward_host}:{h.forward_port}",
-            resolved_ip,
-            ipam_display,
-            container_name or "—",
-            assessment,
+            h.domain, forward_display, resolved_ip,
+            ipam_display, container_name or "—", assessment,
         ])
+
+    # ── Domains in baseline that have vanished from NPM ─────────────────────
+    if baseline is not None:
+        for domain, prev in sorted(baseline.items()):
+            if domain not in seen_domains:
+                rows.append([
+                    domain,
+                    prev.get("forward", "—"),
+                    prev.get("resolved_ip", "—"),
+                    prev.get("phpipam_host", "—"),
+                    prev.get("container", "—"),
+                    "🔴 REMOVED — was in baseline, gone from NPM",
+                ])
 
     headers = ["Domain", "Forward", "Resolved IP", "phpIPAM Host", "Container", "Assessment"]
     print(tabulate(rows, headers=headers, tablefmt="simple"))
 
-    total     = len(rows)
-    warnings  = sum(1 for r in rows if "⚠" in r[-1])
-    errors    = sum(1 for r in rows if "❌" in r[-1])
-    disabled  = sum(1 for r in rows if "⏸" in r[-1])
-    print(f"\n  Total: {total}  |  ✅ Consistent: {total - warnings - errors}  "
-          f"|  ⚠ Verify: {warnings}  |  ❌ Errors: {errors}  |  ⏸ Disabled: {disabled}")
+    total    = len(rows)
+    changed  = sum(1 for r in rows if "🔴" in r[-1] or "🟡" in r[-1])
+    new_     = sum(1 for r in rows if "🆕" in r[-1])
+    ok       = sum(1 for r in rows if "✅" in r[-1])
+    errors   = sum(1 for r in rows if "❌" in r[-1])
+    disabled = sum(1 for r in rows if "⏸" in r[-1])
+    warnings = sum(1 for r in rows if "⚠" in r[-1])
+
+    if baseline is not None:
+        print(f"\n  Total: {total}  |  ✅ Unchanged: {ok}  |  🔴🟡 Changed: {changed}"
+              f"  |  🆕 New: {new_}  |  ❌ Errors: {errors}  |  ⏸ Disabled: {disabled}")
+    else:
+        print(f"\n  Total: {total}  |  ✅ Consistent: {ok}  |  ⚠ Verify: {warnings}"
+              f"  |  ❌ Errors: {errors}  |  ⏸ Disabled: {disabled}"
+              f"  |  (run with --save-baseline to enable change detection)")
+
+    if save_baseline:
+        _save_baseline(BASELINE_PATH, current_entries)
 
     if write_csv:
         _write_csv("audit_output/npm_consistency.csv", headers, rows)
@@ -770,6 +823,34 @@ def _assess_consistency(domain: str, forward_host: str,
         return f"⚠ verify — '{subdomain}' shares no tokens with destination"
 
 
+BASELINE_PATH = Path("audit_output/npm_baseline.json")
+
+
+def _load_baseline(path: Path) -> dict:
+    """Load a saved baseline.  Returns {} if the file doesn't exist."""
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("entries", {})
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"  [baseline] Could not read {path}: {e} — treating as empty")
+        return {}
+
+
+def _save_baseline(path: Path, entries: dict):
+    """Write entries to the baseline file, creating directories as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "entries":  entries,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"  → Baseline saved: {path}  ({len(entries)} entries)")
+
+
 def _make_subnet_filter(
     networks: list[ipaddress.IPv4Network],
 ) -> "Callable[[str], bool]":
@@ -801,6 +882,9 @@ def main():
     parser.add_argument("--known-subnets-only", action="store_true",
                         help="Exclude IPs from Portainer and UniFi that do not fall "
                              "within any subnet defined in phpIPAM")
+    parser.add_argument("--save-baseline", action="store_true",
+                        help="After running Report 3, save the current NPM proxy state "
+                             "as the new baseline for future change detection")
     args = parser.parse_args()
 
     run1 = args.report in ("1", "both", "all")
@@ -843,8 +927,20 @@ def main():
         npm = NpmClient(NPM_URL, NPM_USER, NPM_PASS, debug=args.debug)
         proxy_hosts = npm.fetch_proxy_hosts()
         print(f"  Found {len(proxy_hosts)} proxy host entries in NPM")
-        report_npm_consistency(proxy_hosts, phpipam_addresses, containers,
-                               write_csv=args.csv, debug=args.debug)
+
+        baseline = _load_baseline(BASELINE_PATH)
+        if baseline:
+            print(f"  Baseline loaded: {len(baseline)} entries from {BASELINE_PATH}")
+        else:
+            print(f"  No baseline found — run with --save-baseline to create one")
+
+        report_npm_consistency(
+            proxy_hosts, phpipam_addresses, containers,
+            baseline=baseline or None,
+            save_baseline=args.save_baseline,
+            write_csv=args.csv,
+            debug=args.debug,
+        )
 
     print()
 
