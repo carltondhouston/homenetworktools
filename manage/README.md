@@ -1,6 +1,6 @@
 # network_audit.py
 
-A two-report audit tool for home/small-office networks running **Portainer**, **phpIPAM**, and **UniFi (UDM Pro)**. Designed to keep Docker container IPs and network client IPs honest — statically assigned, documented in phpIPAM, and consistent with what UniFi sees.
+A three-report audit tool for home/small-office networks running **Portainer**, **phpIPAM**, **UniFi (UDM Pro)**, and **Nginx Proxy Manager**. Designed to keep Docker container IPs and network client IPs honest — statically assigned, documented in phpIPAM, consistent with what UniFi sees, and proxied to the right destinations in NPM.
 
 ---
 
@@ -32,12 +32,28 @@ Pulls the full client list from UniFi (both active and all known clients) and co
 
 ---
 
+### Report 3 — NPM Proxy Host Consistency
+
+For each proxy host in Nginx Proxy Manager, resolves the `forward_host` to an IP address, then cross-references that IP against phpIPAM (for its recorded hostname) and Portainer (for a matching container name). Produces an assessment for each entry:
+
+- **✅ consistent** — the proxy domain name shares tokens with the destination name (e.g. `ipam.chcasa.us` → `phpipam-web` → match on `ipam`)
+- **⚠ verify** — no name overlap detected; worth a manual check
+- **❌ cannot resolve** — the forward host couldn't be resolved to an IP
+- **⏸ disabled** — the proxy rule is present but disabled in NPM
+
+The consistency check is a heuristic, not authoritative. It tokenises the subdomain of the proxy domain and the destination names on common separators (`-`, `_`, `.`) and looks for any shared token of three or more characters. This catches obvious mismatches (e.g. `wiki.chcasa.us` pointing to `phpipam-web`) while being lenient enough to handle naming variations.
+
+Disabled proxy hosts are included in the report but prefixed so they stand out.
+
+---
+
 ## Requirements
 
 - Python 3.10+
 - Portainer with API access
 - phpIPAM with API enabled
 - UniFi Network Application on a UniFi OS console (UDM Pro, UDR, UCG, etc.)
+- Nginx Proxy Manager with admin credentials
 
 ```bash
 pip install requests urllib3 tabulate python-dotenv
@@ -108,16 +124,19 @@ Copy `.env.example` to `.env` and fill in your values. The `.env` file is exclud
 | `UNIFI_URL` | No | `https://192.168.1.1` | UDM Pro address |
 | `UNIFI_SITE` | No | `default` | UniFi internal site ID |
 | `UNIFI_API_KEY` | **Yes** | — | Local Network Application API key |
+| `NPM_URL` | No | `http://npm.chcasa.us:81` | Base URL of your NPM instance including port |
+| `NPM_USER` | **Yes** | — | NPM admin email address |
+| `NPM_PASS` | **Yes** | — | NPM admin password |
 
 ---
 
 ## Usage
 
 ```bash
-# Run both reports, console output only
+# Run all three reports, console output only
 python3 network_audit.py
 
-# Run both reports and write CSV files to ./audit_output/
+# Run all reports and write CSV files to ./audit_output/
 python3 network_audit.py --csv
 
 # Run only the container audit (Report 1)
@@ -126,6 +145,12 @@ python3 network_audit.py --report 1
 # Run only the UniFi/phpIPAM diff (Report 2)
 python3 network_audit.py --report 2
 
+# Run only the NPM proxy consistency check (Report 3)
+python3 network_audit.py --report 3
+
+# Reports 1 and 2 only (original "both" behaviour)
+python3 network_audit.py --report both
+
 # Exclude IPs that don't fall within any subnet defined in phpIPAM
 python3 network_audit.py --known-subnets-only
 
@@ -133,7 +158,7 @@ python3 network_audit.py --known-subnets-only
 python3 network_audit.py --debug
 
 # Combine flags
-python3 network_audit.py --report 2 --known-subnets-only --csv --debug
+python3 network_audit.py --report 3 --csv --debug
 ```
 
 ### `--known-subnets-only`
@@ -178,12 +203,25 @@ doodoo     uptime-kuma      running  bridge     172.18.0.3    ⚠ dynamic  ❌ N
 
 ### CSV
 
-When `--csv` is passed, two files are written to `./audit_output/`:
+When `--csv` is passed, up to three files are written to `./audit_output/`:
 
 - `container_audit.csv` — Report 1 data
 - `unifi_phpipam_diff.csv` — Report 2 data
+- `npm_consistency.csv` — Report 3 data
 
 The `audit_output/` directory is excluded from version control by `.gitignore`.
+
+---
+
+### 5. Configure Nginx Proxy Manager
+
+NPM uses email/password authentication to issue a JWT — there is no API key option. Set `NPM_USER` and `NPM_PASS` in `.env` to your NPM admin credentials.
+
+`NPM_URL` should include the port (default is `81`):
+
+```
+NPM_URL=http://npm.chcasa.us:81
+```
 
 ---
 
@@ -191,7 +229,7 @@ The `audit_output/` directory is excluded from version control by `.gitignore`.
 
 ```
 .
-├── network_audit.py    # Main script
+├── network_audit.py    # Main script  (Reports 1, 2, 3)
 ├── .env.example        # Environment variable template
 ├── .env                # Your local credentials (git-ignored)
 ├── .gitignore

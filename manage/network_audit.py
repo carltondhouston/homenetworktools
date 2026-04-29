@@ -2,7 +2,7 @@
 """
 network_audit.py
 ----------------
-Two-part network audit tool:
+Three-part network audit tool:
 
   Report 1 — Container IP Audit
       Queries Portainer for all containers on 'canister' and 'doodoo',
@@ -13,6 +13,12 @@ Two-part network audit tool:
       Compares every device UniFi knows about against phpIPAM's address
       space and flags IPs that are missing from either side, plus
       hostname / MAC mismatches where both sides have a record.
+
+  Report 3 — NPM Proxy Host Consistency
+      For each proxy host in Nginx Proxy Manager, resolves the forward
+      destination to an IP, looks it up in phpIPAM and Portainer, and
+      assesses whether the destination name is consistent with the
+      proxy domain name.
 
 Output: console tables + optional CSV files.
 
@@ -28,6 +34,7 @@ import argparse
 import csv
 import ipaddress
 import os
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +86,10 @@ UNIFI_API_KEY   = _require("UNIFI_API_KEY")   # Network Application → Settings
 _hosts_raw      = os.getenv("PORTAINER_HOSTS", "canister,doodoo")
 PORTAINER_HOSTS = [h.strip() for h in _hosts_raw.split(",") if h.strip()]
 
+NPM_URL         = os.getenv("NPM_URL",  "http://npm.chcasa.us:81")
+NPM_USER        = _require("NPM_USER")    # NPM admin email address
+NPM_PASS        = _require("NPM_PASS")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATA CLASSES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -107,6 +118,15 @@ class UnifiClientRecord:
     hostname: str
     is_wired: bool
     last_seen: int          # epoch
+
+
+@dataclass
+class NpmProxyRecord:
+    domain: str           # e.g. ipam.chcasa.us
+    forward_host: str     # as configured in NPM (IP, hostname, or FQDN)
+    forward_port: int
+    forward_scheme: str   # http / https
+    enabled: bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -533,6 +553,74 @@ def report_unifi_vs_phpipam(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  NPM API
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NpmClient:
+    def __init__(self, base_url: str, email: str, password: str, debug: bool = False):
+        self.base    = base_url.rstrip("/")
+        self._debug  = debug
+        self.session = requests.Session()
+        self.session.verify = False
+        self._authenticate(email, password)
+
+    def _authenticate(self, email: str, password: str):
+        r = self.session.post(
+            f"{self.base}/api/tokens",
+            json={"identity": email, "secret": password},
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = r.json().get("token")
+        if not token:
+            sys.exit("NPM auth failed: no token in response")
+        self.session.headers.update({"Authorization": f"Bearer {token}"})
+
+    def _get(self, path: str, timeout: int = 10) -> list | dict:
+        url = f"{self.base}{path}"
+        if self._debug:
+            import time
+            print(f"  [NPM] GET {url}", flush=True)
+            t0 = time.monotonic()
+        try:
+            r = self.session.get(url, timeout=timeout)
+        except requests.exceptions.Timeout:
+            print(f"  [NPM] *** TIMEOUT after {timeout}s: {url}", flush=True)
+            return []
+        except requests.exceptions.ConnectionError as e:
+            print(f"  [NPM] *** CONNECTION ERROR: {e}", flush=True)
+            return []
+        if self._debug:
+            elapsed = time.monotonic() - t0
+            print(f"  [NPM]  -> {r.status_code} in {elapsed:.2f}s", flush=True)
+        r.raise_for_status()
+        return r.json()
+
+    def fetch_proxy_hosts(self) -> list[NpmProxyRecord]:
+        hosts = self._get("/api/nginx/proxy-hosts?expand=certificate")
+        if not isinstance(hosts, list):
+            print("  [NPM] Unexpected response shape for proxy hosts", flush=True)
+            return []
+        records = []
+        for h in hosts:
+            # NPM supports multiple domain names per host; expand each one
+            domains = h.get("domain_names") or []
+            fwd_host   = h.get("forward_host", "")
+            fwd_port   = int(h.get("forward_port", 80))
+            fwd_scheme = h.get("forward_scheme", "http")
+            enabled    = not h.get("disabled", False)
+            for domain in domains:
+                records.append(NpmProxyRecord(
+                    domain=domain,
+                    forward_host=fwd_host,
+                    forward_port=fwd_port,
+                    forward_scheme=fwd_scheme,
+                    enabled=enabled,
+                ))
+        return records
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -543,6 +631,143 @@ def _write_csv(path: str, headers: list[str], rows: list[list]):
         w.writerow(headers)
         w.writerows(rows)
     print(f"  → CSV written: {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REPORT 3 — NPM PROXY HOST CONSISTENCY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def report_npm_consistency(
+    proxy_hosts: list[NpmProxyRecord],
+    phpipam_addresses: dict[str, PhpIpamRecord],
+    containers: list[ContainerRecord] | None,
+    write_csv: bool = False,
+    debug: bool = False,
+):
+    print("\n" + "═" * 110)
+    print("  REPORT 3 — NPM PROXY HOST CONSISTENCY")
+    print("═" * 110)
+
+    # Build a flat IP → container_name lookup from Portainer data
+    ip_to_container: dict[str, str] = {}
+    if containers:
+        for c in containers:
+            for net in c.networks.values():
+                ip = net.get("ip", "")
+                if ip:
+                    ip_to_container[ip] = c.name
+
+    rows = []
+    for h in sorted(proxy_hosts, key=lambda x: x.domain):
+        status_prefix = "" if h.enabled else "⏸ disabled — "
+
+        # Resolve forward_host to an IP
+        resolved_ip = _resolve_host(h.forward_host)
+        if debug and h.forward_host != resolved_ip:
+            print(f"  [NPM] {h.forward_host} → {resolved_ip or 'unresolvable'}", flush=True)
+
+        if not resolved_ip:
+            rows.append([
+                h.domain,
+                f"{h.forward_host}:{h.forward_port}",
+                "—",
+                "—",
+                "—",
+                f"{status_prefix}❌ cannot resolve forward host",
+            ])
+            continue
+
+        phpipam_rec   = phpipam_addresses.get(resolved_ip)
+        phpipam_host  = phpipam_rec.hostname if phpipam_rec else ""
+        container_name = ip_to_container.get(resolved_ip, "")
+
+        if not phpipam_rec:
+            ipam_display = "❌ not in phpIPAM"
+        else:
+            ipam_display = phpipam_host or "(no hostname)"
+
+        assessment = _assess_consistency(
+            h.domain, h.forward_host, phpipam_host, container_name
+        )
+        if status_prefix:
+            assessment = status_prefix + assessment
+
+        rows.append([
+            h.domain,
+            f"{h.forward_scheme}://{h.forward_host}:{h.forward_port}",
+            resolved_ip,
+            ipam_display,
+            container_name or "—",
+            assessment,
+        ])
+
+    headers = ["Domain", "Forward", "Resolved IP", "phpIPAM Host", "Container", "Assessment"]
+    print(tabulate(rows, headers=headers, tablefmt="simple"))
+
+    total     = len(rows)
+    warnings  = sum(1 for r in rows if "⚠" in r[-1])
+    errors    = sum(1 for r in rows if "❌" in r[-1])
+    disabled  = sum(1 for r in rows if "⏸" in r[-1])
+    print(f"\n  Total: {total}  |  ✅ Consistent: {total - warnings - errors}  "
+          f"|  ⚠ Verify: {warnings}  |  ❌ Errors: {errors}  |  ⏸ Disabled: {disabled}")
+
+    if write_csv:
+        _write_csv("audit_output/npm_consistency.csv", headers, rows)
+
+
+_dns_cache: dict[str, str] = {}
+
+def _resolve_host(host: str) -> str:
+    """Resolve a hostname to an IP string. Returns the original string on
+    failure so callers can still display it.  Results are cached."""
+    if not host:
+        return ""
+    # Already an IP?
+    try:
+        ipaddress.IPv4Address(host)
+        return host
+    except ValueError:
+        pass
+    if host in _dns_cache:
+        return _dns_cache[host]
+    try:
+        ip = socket.gethostbyname(host)
+        _dns_cache[host] = ip
+        return ip
+    except socket.gaierror:
+        _dns_cache[host] = ""
+        return ""
+
+
+def _assess_consistency(domain: str, forward_host: str,
+                         phpipam_hostname: str, container_name: str) -> str:
+    """Heuristic: does the proxy domain *look like* it belongs to the
+    destination?  We tokenise both sides on common separators and check for
+    any shared token of length >= 3.  This catches ipam↔phpipam-web,
+    portainer↔portainer, wiki↔wiki, etc. while not claiming certainty."""
+
+    def tokens(s: str) -> set[str]:
+        import re
+        parts = re.split(r"[-_. /:]", s.lower())
+        return {p for p in parts if len(p) >= 3}
+
+    # Pull just the subdomain from the proxy domain (drop the base domain)
+    subdomain = domain.split(".")[0] if "." in domain else domain
+    left = tokens(subdomain)
+
+    # Gather all name tokens from the destination side
+    right: set[str] = set()
+    for name in (forward_host, phpipam_hostname, container_name):
+        right |= tokens(name)
+
+    if not right:
+        return "ℹ no destination name to compare"
+
+    overlap = left & right
+    if overlap:
+        return f"✅ consistent  ({', '.join(sorted(overlap))})"
+    else:
+        return f"⚠ verify — '{subdomain}' shares no tokens with destination"
 
 
 def _make_subnet_filter(
@@ -569,8 +794,8 @@ def _make_subnet_filter(
 def main():
     parser = argparse.ArgumentParser(description="Network audit: Portainer / phpIPAM / UniFi")
     parser.add_argument("--csv", action="store_true", help="Also write CSV output files")
-    parser.add_argument("--report", choices=["1", "2", "both"], default="both",
-                        help="Which report to run (default: both)")
+    parser.add_argument("--report", choices=["1", "2", "3", "both", "all"], default="all",
+                        help="Which report(s) to run: 1, 2, 3, both (1+2), or all (default: all)")
     parser.add_argument("--debug", action="store_true",
                         help="Print each HTTP request with URL, status, and elapsed time")
     parser.add_argument("--known-subnets-only", action="store_true",
@@ -578,8 +803,9 @@ def main():
                              "within any subnet defined in phpIPAM")
     args = parser.parse_args()
 
-    run1 = args.report in ("1", "both")
-    run2 = args.report in ("2", "both")
+    run1 = args.report in ("1", "both", "all")
+    run2 = args.report in ("2", "both", "all")
+    run3 = args.report in ("3", "all")
 
     print("\n[ phpIPAM ] Authenticating and fetching addresses...")
     phpipam = PhpIpamClient(PHPIPAM_URL, PHPIPAM_APP, PHPIPAM_TOKEN, debug=args.debug)
@@ -593,11 +819,14 @@ def main():
         print(f"  Subnet filter active: {len(known_networks)} phpIPAM subnet(s) — "
               f"IPs outside these will be excluded from reports")
 
-    if run1:
+    containers = None
+    if run1 or run3:
         print("\n[ Portainer ] Fetching containers...")
-        portainer = PortainerClient(PORTAINER_URL, PORTAINER_TOKEN)
+        portainer  = PortainerClient(PORTAINER_URL, PORTAINER_TOKEN)
         containers = portainer.fetch_all_containers(PORTAINER_HOSTS)
         print(f"  Found {len(containers)} containers across {PORTAINER_HOSTS}")
+
+    if run1:
         report_container_audit(containers, phpipam_addresses,
                                subnet_filter=subnet_filter, write_csv=args.csv)
 
@@ -608,6 +837,14 @@ def main():
         print(f"  Found {len(unifi_clients)} clients with known IPs in UniFi")
         report_unifi_vs_phpipam(unifi_clients, phpipam_addresses,
                                 subnet_filter=subnet_filter, write_csv=args.csv)
+
+    if run3:
+        print("\n[ NPM ] Fetching proxy hosts...")
+        npm = NpmClient(NPM_URL, NPM_USER, NPM_PASS, debug=args.debug)
+        proxy_hosts = npm.fetch_proxy_hosts()
+        print(f"  Found {len(proxy_hosts)} proxy host entries in NPM")
+        report_npm_consistency(proxy_hosts, phpipam_addresses, containers,
+                               write_csv=args.csv, debug=args.debug)
 
     print()
 
