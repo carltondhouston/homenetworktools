@@ -4,6 +4,9 @@
 # Audit CSV output (ephemeral)
 audit_output/*.csv
 
+# Export data from Unifi Export process
+unifi_export_*.json
+
 # Baseline IS committed — it's the source of truth for change detection
 # audit_output/npm_baseline.json  ← intentionally not ignored
 
