@@ -64,7 +64,10 @@ ENDPOINTS = [
     ("health",              "/proxy/network/api/s/{site}/stat/health"),
     ("dashboard",           "/proxy/network/api/s/{site}/stat/dashboard"),
     ("alarms",              "/proxy/network/api/s/{site}/list/alarm"),
-    ("events_recent",       "/proxy/network/api/s/{site}/stat/event"),
+    ("events_recent",       "/proxy/network/api/s/{site}/stat/event?_limit=200"),
+    # ── Switch port details ─────────────────────────────────────
+    ("port_overrides",      "/proxy/network/api/s/{site}/rest/device"),
+    ("port_profiles_full",  "/proxy/network/api/s/{site}/rest/portconf"),
 ]
 
 
@@ -104,18 +107,82 @@ def fetch(session: requests.Session, base_url: str, path: str) -> tuple[bool, an
         return False, {"error": str(exc)}
 
 
-def sanitize(obj, redact_keys=("password", "x_passphrase", "x_password",
-                                "private_key", "secret", "psk", "api_key")):
-    """Recursively redact sensitive values so the export is safe to share."""
+def sanitize(obj):
+    """
+    Recursively redact sensitive values so the export is safe to share.
+
+    Catches three categories:
+      1. Key-name patterns  — field names that suggest a secret value
+      2. Value patterns     — values that look like key material regardless of field name
+                              (PEM blocks, long hex/base64 tokens)
+      3. Explicit field list — known UniFi fields that weren't caught by the above
+    """
+    # ── 1. Key-name substrings that always indicate a secret ──────────────────
+    SENSITIVE_KEY_FRAGMENTS = (
+        "password", "passwd",           # passwords / hashes
+        "passphrase",                   # WPA passphrases
+        "private_key", "privatekey",    # RSA/EC private keys
+        "secret",                       # RADIUS shared secret, mesh PSK, etc.
+        "psk",                          # pre-shared keys
+        "api_key", "apikey", "api_token", "apitoken",  # API credentials
+        "mgmt_key", "mgmtkey",          # controller management key
+        "token",                        # generic tokens
+        "certificate_key", "cert_key",  # TLS private keys stored alongside certs
+        "x_ssh",                        # all UniFi x_ssh_* fields (keys, hashes, passwd)
+        "x_mesh",                       # mesh PSK / ESSID
+        "x_mgmt",                       # management key
+        "community",                    # SNMP community string
+    )
+
+    # ── 2. Known full field names that are always sensitive ───────────────────
+    SENSITIVE_EXACT_FIELDS = {
+        "server_certificate",           # UniFi RADIUS: PEM bundle with embedded private key
+        "server_certificate_key",       # UniFi RADIUS: standalone private key
+        "ca_certificate",               # CA cert — not a secret but contains PEM material
+        "x_api_token",                  # local controller API token
+        "x_mgmt_key",                   # controller management key
+        "utm_token",                    # IPS/UTM token
+    }
+
     if isinstance(obj, dict):
-        return {
-            k: ("**REDACTED**" if any(r in k.lower() for r in redact_keys)
-                else sanitize(v, redact_keys))
-            for k, v in obj.items()
-        }
+        result = {}
+        for k, v in obj.items():
+            kl = k.lower()
+            # Check exact match first
+            if k in SENSITIVE_EXACT_FIELDS:
+                result[k] = "**REDACTED**"
+            # Check key-name fragment match
+            elif any(frag in kl for frag in SENSITIVE_KEY_FRAGMENTS):
+                result[k] = "**REDACTED**"
+            # Check if the value itself looks like key material (even if field name is innocent)
+            elif isinstance(v, str) and _looks_like_key_material(v):
+                result[k] = "**REDACTED**"
+            else:
+                result[k] = sanitize(v)
+        return result
+
     if isinstance(obj, list):
-        return [sanitize(i, redact_keys) for i in obj]
+        return [sanitize(i) for i in obj]
+
     return obj
+
+
+def _looks_like_key_material(value: str) -> bool:
+    """
+    Heuristic: does this string look like a raw cryptographic secret?
+    Catches PEM blocks, long hex strings, and long base64 blobs.
+    """
+    import re
+    if "-----BEGIN" in value and "KEY" in value:
+        return True  # PEM private key block
+    # Long hex string (>= 40 chars, only hex)
+    if re.fullmatch(r"[0-9a-fA-F]{40,}", value):
+        return True
+    # Long base64-ish blob (>= 100 chars) — catches encoded certs/keys
+    # but avoids triggering on normal short base64 like MAC addresses
+    if len(value) >= 100 and re.fullmatch(r"[A-Za-z0-9+/=\n]+", value):
+        return True
+    return False
 
 
 def main():
@@ -154,6 +221,8 @@ def main():
     # Optionally redact secrets
     if not args.no_redact:
         results = sanitize(results)
+        print("\n  Redaction applied. Fields caught by: key-name patterns, exact-field list,")
+        print("  and value heuristics (PEM blocks, hex strings, long base64 blobs).")
 
     export = {
         "meta": {
